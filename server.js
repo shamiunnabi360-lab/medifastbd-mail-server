@@ -56,16 +56,16 @@ function getTransport() {
     console.warn("⚠️  MAIL_USER / MAIL_APP_PASSWORD not set. Email disabled.");
     return null;
   }
-cachedTransport = nodemailer.createTransport({
-         host: "smtp.gmail.com",                                                                              Code Indexing
-         port: 465,                                                                                           • Disabled
-         secure: true, // SSL — works on Render Free; STARTTLS:587 often blocked
-         auth: { user, pass },                                                                                LSP
-         pool: true,                                                                                          LSPs are disabled
-         maxConnections: 3,
-         rateDelta: 1000,                                                                                     ▼ Modified Files
-         rateLimit: 5, // nodemailer internal throttle                                                        .env.example                     +12 █
-       });
+  cachedTransport = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true, // SSL — works on Render Free; STARTTLS:587 often blocked
+    auth: { user, pass },
+    pool: true,
+    maxConnections: 3,
+    rateDelta: 1000,
+    rateLimit: 5, // nodemailer internal throttle
+  });
   return cachedTransport;
 }
 
