@@ -1,35 +1,36 @@
 /**
  * get-token.js — one-time Gmail API setup for the MediFastBD mail server.
  *
- * Walks you through Google's OAuth consent in a browser and prints a
- * REFRESH TOKEN that never expires (unless you revoke it). Paste it into
- * Render as GMAIL_REFRESH_TOKEN.
+ * Walks you through Google's OAuth consent and prints a REFRESH TOKEN that
+ * never expires (unless you revoke it). Paste the printed values into
+ * Render as GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN.
  *
  * Before running:
- *   1. Google Cloud Console (console.cloud.google.com) → pick the project
- *      your Firebase app uses → APIs & Services → Library → search
- *      "Gmail API" → Enable.
- *   2. APIs & Services → OAuth consent screen → External → fill the app
- *      name/email → add your own Gmail as a Test user.
- *   3. APIs & Services → Credentials → Create credentials → OAuth client
- *      ID → Application type: Desktop app → copy the Client ID + Secret.
+ *   1. Google Cloud Console → APIs & Services → Library → "Gmail API" → Enable.
+ *   2. OAuth consent screen → External → add your Gmail as a Test user
+ *      (or publish the app to production).
+ *   3. Credentials → Create credentials → OAuth client ID → Desktop app
+ *      → copy the Client ID + Secret.
  *
  * Run (from carelink-server/):
  *   GMAIL_CLIENT_ID=xxx GMAIL_CLIENT_SECRET=yyy node get-token.js
  * or on Windows PowerShell:
  *   $env:GMAIL_CLIENT_ID="xxx"; $env:GMAIL_CLIENT_SECRET="yyy"; node get-token.js
  *
+ * NOTE: after you click "Allow", the browser WILL show "can't reach this
+ * page" — that is normal. Copy the URL from the address bar and paste it
+ * back here; this script exchanges the code without needing a local
+ * web server, so port/timing problems can never occur.
+ *
  * Requires no npm dependencies (Node 18+).
  */
 
-const http = require("http");
 const crypto = require("crypto");
-const { exec } = require("child_process");
+const readline = require("readline");
 
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID || "";
 const CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET || "";
-const PORT = 4692;
-const REDIRECT_URI = `http://localhost:${PORT}`;
+const REDIRECT_URI = "http://localhost:4692";
 const SCOPE = "https://www.googleapis.com/auth/gmail.send";
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
@@ -56,27 +57,47 @@ const authUrl =
   `&code_challenge=${codeChallenge}` +
   "&code_challenge_method=S256";
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, REDIRECT_URI);
-  const code = url.searchParams.get("code");
-  const error = url.searchParams.get("error");
+console.log("\n1️⃣  Open this URL in your browser and sign in with the");
+console.log("    Gmail account that will SEND the emails:\n");
+console.log(authUrl + "\n");
+console.log("    (Trying to auto-open it for you… if nothing happens, copy the URL above.)\n");
 
-  if (error) {
-    res.writeHead(200, { "content-type": "text/html" });
-    res.end("<h2>Consent failed: " + error + "</h2>You can close this tab.");
-    console.error("❌ Consent error:", error);
+const open =
+  process.platform === "win32"
+    ? `start "" "${authUrl}"`
+    : process.platform === "darwin"
+      ? `open "${authUrl}"`
+      : `xdg-open "${authUrl}"`;
+require("child_process").exec(open, () => {});
+
+console.log("2️⃣  Click Allow.");
+console.log("    ⚠️  The browser will then show “can't reach this page” — THAT IS NORMAL.");
+console.log("    Copy the FULL URL from the browser's address bar");
+console.log("    (it looks like http://localhost:4692/?code=4/0Axxx…&scope=…)");
+console.log("    and paste it below, then press Enter.\n");
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+rl.question("Pasted URL (or just the code): ", async (answer) => {
+  rl.close();
+
+  const raw = (answer || "").trim();
+  let code = raw;
+
+  // Accept a full URL, a redirect URL with extra params, or a bare code.
+  const match = raw.match(/[?&]code=([^&\s]+)/);
+  if (match) code = decodeURIComponent(match[1]);
+  if (code.startsWith("http")) {
+    console.error("❌ That looks like a URL but no ?code= parameter was found in it.");
     process.exit(1);
   }
   if (!code) {
-    res.writeHead(404).end();
-    return;
+    console.error("❌ Nothing pasted. Run the script again.");
+    process.exit(1);
   }
-
-  res.writeHead(200, { "content-type": "text/html" });
-  res.end(
-    "<h2>✅ Success — refresh token printed in the terminal.</h2>You can close this tab."
-  );
-  server.close();
 
   try {
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
@@ -93,15 +114,18 @@ const server = http.createServer(async (req, res) => {
     });
     const data = await tokenRes.json();
     if (!data.refresh_token) {
-      console.error(
-        "❌ No refresh_token in response. Re-run and make sure to pick your account and click Allow (prompt=consent is set, so this should not happen)."
-      );
+      console.error("❌ No refresh_token in the response. Details:");
       console.error(JSON.stringify(data, null, 2));
+      console.error(
+        "\nIf the error is redirect_uri_mismatch, the OAuth client must be type\n" +
+          "“Desktop app”. If invalid_grant, the code was already used or expired —\n" +
+          "run this script again and paste a FRESH URL."
+      );
       process.exit(1);
     }
 
     console.log("\n════════════════════════════════════════════════════════");
-    console.log("✅ Add these to Render (Environment) — and keep them secret:");
+    console.log("✅ Success! Add these to Render (Environment) — keep them secret:");
     console.log("════════════════════════════════════════════════════════\n");
     console.log(`GMAIL_CLIENT_ID=${CLIENT_ID}`);
     console.log(`GMAIL_CLIENT_SECRET=${CLIENT_SECRET}`);
@@ -117,30 +141,4 @@ const server = http.createServer(async (req, res) => {
     console.error("❌ Token exchange failed:", e.message);
     process.exit(1);
   }
-});
-
-server.on("error", (e) => {
-  if (e.code === "EADDRINUSE") {
-    console.error(
-      `❌ Port ${PORT} is busy — an earlier run of this script is still open.`
-    );
-    console.error(
-      "   Find and kill it:  netstat -ano | findstr :4692  →  taskkill /PID <pid> /F"
-    );
-    process.exit(1);
-  }
-  throw e;
-});
-
-server.listen(PORT, () => {
-  console.log("Opening Google consent in your browser…");
-  console.log("(If nothing opens, paste this URL manually):\n");
-  console.log(authUrl + "\n");
-  const open =
-    process.platform === "win32"
-      ? `start "" "${authUrl}"`
-      : process.platform === "darwin"
-        ? `open "${authUrl}"`
-        : `xdg-open "${authUrl}"`;
-  exec(open, () => {});
 });
