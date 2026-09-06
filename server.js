@@ -13,15 +13,14 @@
  *
  * Required environment variables:
  *   FIREBASE_SERVICE_ACCOUNT   — JSON string of Firebase service account key
- *   MAIL_USER                  — Gmail address that sends email
- *   MAIL_APP_PASSWORD          — Gmail App Password (NOT the real password)
+ *   BREVO_API_KEY              — Brevo transactional email API key (300/day free)
+ *   MAIL_USER                  — verified sender email (the address Brevo sends from)
  *   MAIL_SHARED_SECRET         — secret header value for the /send endpoint
  *   PORT                       — optional, defaults to 3000
  */
 
 const express = require("express");
 const admin = require("firebase-admin");
-const nodemailer = require("nodemailer");
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
@@ -53,28 +52,75 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// ─── Email Transport (lazy) ─────────────────────────────────────────────
+// ─── Email sending (Brevo HTTP API) ─────────────────────────────────────
+// Render blocks outbound SMTP ports (25/465/587) on every plan, so Gmail
+// SMTP is unreachable from there. Brevo's HTTPS API works from any host;
+// the free tier allows 300 emails/day with a single verified sender.
 
-let cachedTransport = null;
-function getTransport() {
-  if (cachedTransport) return cachedTransport;
-  const user = process.env.MAIL_USER;
-  const pass = process.env.MAIL_APP_PASSWORD;
-  if (!user || !pass) {
-    console.warn("⚠️  MAIL_USER / MAIL_APP_PASSWORD not set. Email disabled.");
-    return null;
+const BREVO_API = "https://api.brevo.com/v3/smtp/email";
+const BREVO_TIMEOUT_MS = 15000;
+
+function brevoConfigured() {
+  return Boolean(process.env.BREVO_API_KEY && process.env.MAIL_USER);
+}
+
+function warnMailDisabled() {
+  if (!process.env.BREVO_API_KEY) {
+    console.warn("⚠️  BREVO_API_KEY not set. Email disabled.");
   }
-  cachedTransport = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true, // SSL — works on Render Free; STARTTLS:587 often blocked
-    auth: { user, pass },
-    pool: true,
-    maxConnections: 3,
-    rateDelta: 1000,
-    rateLimit: 5, // nodemailer internal throttle
-  });
-  return cachedTransport;
+  if (!process.env.MAIL_USER) {
+    console.warn("⚠️  MAIL_USER (verified Brevo sender) not set. Email disabled.");
+  }
+}
+
+/**
+ * Sends one email through Brevo. `to` is a string or an array of strings;
+ * `fromName` labels the verified sender (the address itself is MAIL_USER).
+ * Throws an Error with `e.transient = true` for retryable failures.
+ */
+async function sendMail({ to, subject, text, html, replyTo, fromName }) {
+  if (!brevoConfigured()) {
+    warnMailDisabled();
+    throw new Error("mail_disabled");
+  }
+
+  const body = {
+    sender: { name: fromName || "MediFastBD", email: process.env.MAIL_USER },
+    to: (Array.isArray(to) ? to : [to]).map((email) => ({ email })),
+    subject,
+  };
+  if (html) body.htmlContent = html;
+  if (text) body.textContent = text;
+  if (replyTo) body.replyTo = { email: replyTo };
+
+  let res;
+  try {
+    res = await fetch(BREVO_API, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(BREVO_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const err = new Error(`brevo network error: ${e.message}`);
+    err.transient = true;
+    throw err;
+  }
+
+  if (res.status >= 200 && res.status < 300) return;
+
+  let detail = "";
+  try {
+    const errBody = await res.json();
+    detail = errBody.message || errBody.code || "";
+  } catch (_) {}
+  const err = new Error(`brevo ${res.status}${detail ? ": " + detail : ""}`);
+  err.transient = res.status === 429 || res.status >= 500;
+  throw err;
 }
 
 // ─── Time helpers ───────────────────────────────────────────────────────
@@ -212,13 +258,15 @@ app.post("/send", rateLimit, requireSecret, async (req, res) => {
     return res.status(400).json({ error: "subject_too_long" });
   }
 
-  const transport = getTransport();
-  if (!transport) return res.status(503).json({ error: "mail_disabled" });
+  if (!brevoConfigured()) {
+    warnMailDisabled();
+    return res.status(503).json({ error: "mail_disabled" });
+  }
 
   try {
     await sendWithRetry({
-      from: `"MediFastBD" <${process.env.MAIL_USER}>`,
-      to: recipients.join(", "),
+      fromName: "MediFastBD",
+      to: recipients,
       subject,
       text: text || stripHtml(html),
       html: html || `<pre>${escapeHtml(text || "")}</pre>`,
@@ -426,8 +474,10 @@ async function handleMissed(reminderDoc, reminder, dateKey) {
 async function sendCareLinkEmail(
   userId, medicineName, email1, email2, count, hour, minute
 ) {
-  const transport = getTransport();
-  if (!transport) return;
+  if (!brevoConfigured()) {
+    warnMailDisabled();
+    return;
+  }
 
   let patientName = "A patient";
   try {
@@ -468,8 +518,8 @@ async function sendCareLinkEmail(
     </div>`;
 
   await sendWithRetry({
-    from: `"MediFastBD CareLink" <${process.env.MAIL_USER}>`,
-    to: recipients.join(", "),
+    fromName: "MediFastBD CareLink",
+    to: recipients,
     subject,
     html,
     text: `MediFastBD CareLink – Medication Adherence Alert\n\nPatient: ${patientName}\nMedicine: ${medicineName}\nScheduled: ${time}\nMissed doses: ${count} consecutive\n\nPlease check on the patient if necessary.\n\nThis is an automated message from MediFastBD. Not a medical emergency.`,
@@ -480,16 +530,16 @@ async function sendCareLinkEmail(
 // ─── Send with retry ────────────────────────────────────────────────────
 
 async function sendWithRetry(mail, attempts = 3) {
-  const transport = getTransport();
-  if (!transport) throw new Error("mail_disabled");
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
-      await transport.sendMail(mail);
+      await sendMail(mail);
       return;
     } catch (e) {
       lastErr = e;
-      const transient = /ETIMEDOUT|ECONNRESET|EAI_AGAIN|421|4\.7\.0/i.test(e.message || "");
+      const transient =
+        e.transient === true ||
+        /ETIMEDOUT|ECONNRESET|EAI_AGAIN|timeout|abort/i.test(e.message || "");
       if (!transient || i === attempts - 1) throw e;
       await sleep(500 * Math.pow(2, i));
     }

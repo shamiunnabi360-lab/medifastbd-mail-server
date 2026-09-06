@@ -1,7 +1,7 @@
 {
   "name": "medifastbd-mail-server",
   "version": "1.0.0",
-  "description": "MediFastBD Mail Server - missed-dose alerts and transactional email via Gmail SMTP",
+  "description": "MediFastBD Mail Server - missed-dose alerts and transactional email via Brevo HTTP API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,8 +9,7 @@
   },
   "dependencies": {
     "express": "^4.21.0",
-    "firebase-admin": "^12.7.0",
-    "nodemailer": "^6.9.0"
+    "firebase-admin": "^12.7.0"
   },
   "engines": {
     "node": ">=18.0.0"
