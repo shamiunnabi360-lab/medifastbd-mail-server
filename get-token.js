@@ -119,6 +119,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(
+      `❌ Port ${PORT} is busy — an earlier run of this script is still open.`
+    );
+    console.error(
+      "   Find and kill it:  netstat -ano | findstr :4692  →  taskkill /PID <pid> /F"
+    );
+    process.exit(1);
+  }
+  throw e;
+});
+
 server.listen(PORT, () => {
   console.log("Opening Google consent in your browser…");
   console.log("(If nothing opens, paste this URL manually):\n");
