@@ -26,11 +26,19 @@ const nodemailer = require("nodemailer");
 // ─── Configuration ──────────────────────────────────────────────────────
 
 const GRACE_PERIOD_HOURS = 2;
+const ALERT_THRESHOLD = 2; // consecutive missed doses before an email goes out
 const CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const APP_TZ = "Asia/Dhaka";
 const SEND_RATE_WINDOW_MS = 60 * 1000; // 1 minute
 const SEND_RATE_MAX = 30;              // 30 emails / minute / IP
 const SHARED_SECRET = process.env.MAIL_SHARED_SECRET || "";
+
+// True when the reminder has at least one usable caregiver address.
+function hasCaregiver(reminder) {
+  const e1 = (reminder.caregiverEmail1 || "").trim();
+  const e2 = (reminder.caregiverEmail2 || "").trim();
+  return e1.length > 0 || e2.length > 0;
+}
 
 // ─── Initialize Firebase Admin ──────────────────────────────────────────
 
@@ -265,6 +273,14 @@ async function processReminder(reminderDoc) {
   const dateKey = dhakaDateKey(now);
   const parts = dhakaParts(now);
 
+  // Weekly reminders only count as missed on their scheduled weekdays.
+  if (r.frequency === "weekly" && Array.isArray(r.daysOfWeek) && r.daysOfWeek.length > 0) {
+    // ISO weekday (1 = Mon … 7 = Sun), matching the model's daysOfWeek.
+    const dhakaNow = new Date(now.toLocaleString("en-US", { timeZone: APP_TZ }));
+    const iso = dhakaNow.getDay() === 0 ? 7 : dhakaNow.getDay();
+    if (!r.daysOfWeek.includes(iso)) return;
+  }
+
   const scheduledUTC = dhakaToUtc(
     parts.year, parts.month, parts.day, r.hour, r.minute
   );
@@ -288,7 +304,10 @@ async function processReminder(reminderDoc) {
       return;
     }
     if (outcome === "skipped" || outcome === "missed") {
-      await handleMissed(reminderDoc, r, dateKey);
+      // The user already told us — do NOT overwrite their log with an
+      // auto-detected "missed" record, and do not wait for the grace period.
+      // Update the streak from the real outcome instead.
+      await recordOutcome(reminderId, r, outcome, dateKey);
       return;
     }
   }
@@ -296,12 +315,60 @@ async function processReminder(reminderDoc) {
   await handleMissed(reminderDoc, r, dateKey);
 }
 
+/**
+ * Evaluates the CareLink alert after the user has logged the dose themselves
+ * ("skipped" or "missed"). The Flutter app ALREADY incremented
+ * `consecutiveMissed` when it wrote the log (see ReminderProvider.logDose),
+ * so this must NOT count again — it only decides whether the alert email
+ * goes out now, without waiting for the grace period to expire.
+ */
+async function recordOutcome(reminderId, reminder, outcome, dateKey) {
+  const ctx = { shouldAlert: false, newCount: 0, current: null };
+
+  await db.runTransaction(async (tx) => {
+    const currentDoc = await tx.get(db.collection("reminders").doc(reminderId));
+    if (!currentDoc.exists) return;
+    const current = currentDoc.data();
+
+    const newCount = current.consecutiveMissed || 0;
+
+    const shouldAlert =
+      newCount >= ALERT_THRESHOLD &&
+      !current.alertSentForCurrentStreak &&
+      current.careLinkEnabled &&
+      hasCaregiver(current);
+
+    if (shouldAlert) {
+      tx.update(db.collection("reminders").doc(reminderId), {
+        alertSentForCurrentStreak: true,
+        lastCountedDateKey: dateKey,
+      });
+      ctx.shouldAlert = true;
+      ctx.newCount = newCount;
+      ctx.current = current;
+    }
+    // No update when not alerting — the client already did the bookkeeping.
+  });
+
+  if (ctx.shouldAlert) {
+    await sendCareLinkEmail(
+      reminder.userId,
+      reminder.medicineName,
+      ctx.current.caregiverEmail1,
+      ctx.current.caregiverEmail2,
+      ctx.newCount,
+      reminder.hour,
+      reminder.minute
+    );
+  }
+}
+
 async function handleMissed(reminderDoc, reminder, dateKey) {
   const reminderId = reminderDoc.id;
   const userId = reminder.userId;
   const logId = `${reminderId}_${dateKey}`;
 
-  const ctx = { shouldAlert: false, newCount: 0 };
+  const ctx = { shouldAlert: false, newCount: 0, current: null };
 
   await db.runTransaction(async (tx) => {
     const currentDoc = await tx.get(db.collection("reminders").doc(reminderId));
@@ -329,10 +396,10 @@ async function handleMissed(reminderDoc, reminder, dateKey) {
     };
 
     const shouldAlert =
-      newCount >= 2 &&
+      newCount >= ALERT_THRESHOLD &&
       !current.alertSentForCurrentStreak &&
       current.careLinkEnabled &&
-      (current.caregiverEmail1 || "").trim().length > 0;
+      hasCaregiver(current);
 
     if (shouldAlert) update.alertSentForCurrentStreak = true;
 
@@ -340,14 +407,15 @@ async function handleMissed(reminderDoc, reminder, dateKey) {
 
     ctx.shouldAlert = shouldAlert;
     ctx.newCount = newCount;
+    ctx.current = current;
   });
 
   if (ctx.shouldAlert) {
     await sendCareLinkEmail(
       userId,
       reminder.medicineName,
-      reminder.caregiverEmail1,
-      reminder.caregiverEmail2,
+      ctx.current.caregiverEmail1,
+      ctx.current.caregiverEmail2,
       ctx.newCount,
       reminder.hour,
       reminder.minute
