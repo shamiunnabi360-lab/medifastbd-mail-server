@@ -1,11 +1,12 @@
 {
   "name": "medifastbd-mail-server",
   "version": "1.0.0",
-  "description": "MediFastBD Mail Server - missed-dose alerts and transactional email via SMTP2GO HTTP API",
+  "description": "MediFastBD Mail Server - missed-dose alerts and transactional email via the Gmail API over HTTPS",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "get-token": "node get-token.js"
   },
   "dependencies": {
     "express": "^4.21.0",

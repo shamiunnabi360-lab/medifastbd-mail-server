@@ -6,22 +6,36 @@ Free-tier Node.js server that:
 2. Exposes a tiny `POST /send` endpoint for the Flutter app to send
    transactional emails (receipts, order updates).
 
-Runs on **Render Free** (no credit card). **SMTP2GO** delivers the mail via
-its HTTPS API (1,000 emails/month free). Gmail SMTP does **not** work here —
-Render blocks outbound SMTP ports (25/465/587) on every plan.
+Runs on **Render Free** (no credit card). Mail is delivered through the
+**Gmail API over HTTPS** using your own Google account — no third-party
+email provider needed. Gmail SMTP does **not** work here — Render blocks
+outbound SMTP ports (25/465/587) on every plan — but the Gmail API is
+plain HTTPS (443), which Render allows.
 
 ---
 
 ## One-time setup
 
-### 1. SMTP2GO account (email delivery)
-1. Sign up free at https://www.smtp2go.com (no credit card, no phone
-   verification — just confirm your email address).
-2. Verify **one sender**: Settings → **Verified Senders** → add your
-   Gmail address and click the confirmation link it receives. Caregiver
-   alerts can then go to any recipient — no domain or DNS needed.
-3. Settings → **API Keys** → **Add API Key** → copy it (starts with
-   `api-`).
+### 1. Gmail API access (one-time, ~10 minutes)
+1. [Google Cloud Console](https://console.cloud.google.com) → select the
+   project your Firebase app uses.
+2. **APIs & Services → Library** → search **Gmail API** → **Enable**.
+3. **APIs & Services → OAuth consent screen** → type **External** →
+   fill in app name + your email → under **Test users** add the Gmail
+   address that will send the mail.
+4. **APIs & Services → Credentials → Create credentials → OAuth client
+   ID** → Application type: **Desktop app** → copy the **Client ID** and
+   **Client secret**.
+5. From `carelink-server/`, run:
+   ```bash
+   GMAIL_CLIENT_ID=<id> GMAIL_CLIENT_SECRET=<secret> node get-token.js
+   ```
+   A browser opens → sign in with the sending Gmail → **Allow**. The
+   script prints three values.
+6. (Optional) revert the consent screen to **Internal** if the project
+   belongs to a Workspace org; for personal accounts leave it External.
+7. This refresh token does not expire unless revoked. Re-run the script
+   if you ever rotate it.
 
 ### 2. Firebase service account
 1. Firebase Console → Project Settings → **Service accounts** →
@@ -42,8 +56,10 @@ Render blocks outbound SMTP ports (25/465/587) on every plan.
 4. **Environment**:
    | Key | Value |
    |---|---|
-   | `SMTP2GO_API_KEY` | SMTP2GO API key (`api-…`) |
-   | `MAIL_USER` | your **verified SMTP2GO sender** email |
+   | `GMAIL_CLIENT_ID` | OAuth client ID from step 1 |
+   | `GMAIL_CLIENT_SECRET` | OAuth client secret from step 1 |
+   | `GMAIL_REFRESH_TOKEN` | from `node get-token.js` |
+   | `MAIL_USER` | the Gmail address you signed in with in step 1 |
    | `MAIL_SHARED_SECRET` | any random 32+ char string (Flutter sends it as `X-Mail-Secret`) |
    | `FIREBASE_SERVICE_ACCOUNT` | paste the entire JSON from step 2 on one line |
 5. Click **Create Web Service**. Wait for the first deploy.
@@ -100,7 +116,7 @@ Send a transactional email from your Flutter app.
 
 | Service | Limit | Notes |
 |---|---|---|
-| SMTP2GO API | 1,000 emails / month (200/day) | Plenty for caregiver alerts + receipts |
+| Gmail API | ~500 emails / day | Plenty for caregiver alerts + receipts |
 | Render Free Web Service | 750 hrs / month | Always-on with the uptime pinger |
 | Firestore (Spark) | 50k reads / day | CareLink uses ~100 reads / patient / day |
 | `/send` rate limit | 30 / min / IP | Adjustable in `server.js` |
@@ -111,7 +127,7 @@ Send a transactional email from your Flutter app.
 
 ```bash
 cd carelink-server
-cp ../.env.example .env   # add SMTP2GO_API_KEY / MAIL_USER / etc.
+cp ../.env.example .env   # add GMAIL_* / MAIL_USER / etc.
 npm install
 node server.js
 ```

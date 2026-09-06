@@ -13,14 +13,17 @@
  *
  * Required environment variables:
  *   FIREBASE_SERVICE_ACCOUNT   — JSON string of Firebase service account key
- *   SMTP2GO_API_KEY            — SMTP2GO API key (1,000 emails/month free)
- *   MAIL_USER                  — verified sender email (the address SMTP2GO sends from)
+ *   GMAIL_CLIENT_ID            — OAuth client ID (Desktop app) from Google Cloud
+ *   GMAIL_CLIENT_SECRET        — matching OAuth client secret
+ *   GMAIL_REFRESH_TOKEN        — minted once via `node get-token.js`
+ *   MAIL_USER                  — the Gmail address that sends the email
  *   MAIL_SHARED_SECRET         — secret header value for the /send endpoint
  *   PORT                       — optional, defaults to 3000
  */
 
 const express = require("express");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
@@ -52,31 +55,113 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// ─── Email sending (SMTP2GO HTTP API) ───────────────────────────────────
+// ─── Email sending (Gmail API over HTTPS) ──────────────────────────────
 // Render blocks outbound SMTP ports (25/465/587) on every plan, so Gmail
-// SMTP is unreachable from there. SMTP2GO's HTTPS API works from any host;
-// the free plan allows 1,000 emails/month (200/day, 25/hour) with a single
-// verified sender — no domain, no phone verification.
+// SMTP is unreachable from there — and free email providers (Brevo,
+// SMTP2GO, …) gate signups behind SMS verification or custom domains.
+// The Gmail API is plain HTTPS, works from any host, and needs nothing
+// new: just the Google account already running the Firebase project.
+// A refresh token is minted once by get-token.js; access tokens are
+// refreshed here automatically.
 
-const SMTP2GO_API = "https://api.smtp2go.com/v3/email/send";
-const SMTP2GO_TIMEOUT_MS = 15000;
+const GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GMAIL_SEND_URL =
+  "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
+const GMAIL_TIMEOUT_MS = 20000;
+
+let gmailAccessToken = null;
+let gmailTokenExpiresAt = 0;
 
 function mailConfigured() {
-  return Boolean(process.env.SMTP2GO_API_KEY && process.env.MAIL_USER);
+  return Boolean(
+    process.env.GMAIL_CLIENT_ID &&
+      process.env.GMAIL_CLIENT_SECRET &&
+      process.env.GMAIL_REFRESH_TOKEN &&
+      process.env.MAIL_USER
+  );
 }
 
 function warnMailDisabled() {
-  if (!process.env.SMTP2GO_API_KEY) {
-    console.warn("⚠️  SMTP2GO_API_KEY not set. Email disabled.");
-  }
-  if (!process.env.MAIL_USER) {
-    console.warn("⚠️  MAIL_USER (verified SMTP2GO sender) not set. Email disabled.");
+  for (const key of [
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_REFRESH_TOKEN",
+    "MAIL_USER",
+  ]) {
+    if (!process.env[key]) {
+      console.warn(`⚠️  ${key} not set. Email disabled.`);
+    }
   }
 }
 
+async function getAccessToken() {
+  if (gmailAccessToken && Date.now() < gmailTokenExpiresAt - 60000) {
+    return gmailAccessToken;
+  }
+  const res = await fetch(GMAIL_TOKEN_URL, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: process.env.GMAIL_CLIENT_ID,
+      client_secret: process.env.GMAIL_CLIENT_SECRET,
+      refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+      grant_type: "refresh_token",
+    }),
+    signal: AbortSignal.timeout(GMAIL_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = (await res.json()).error || "";
+    } catch (_) {}
+    const err = new Error(
+      `gmail token refresh failed (${res.status}): ${detail}`
+    );
+    err.transient = res.status === 429 || res.status >= 500;
+    throw err;
+  }
+  const data = await res.json();
+  gmailAccessToken = data.access_token;
+  gmailTokenExpiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+  return gmailAccessToken;
+}
+
+function rfc2822({ to, subject, text, html, replyTo, fromName }) {
+  // B-encode the subject so non-ASCII characters survive intact.
+  const encSubject = `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+  const from = fromName
+    ? `${fromName} <${process.env.MAIL_USER}>`
+    : process.env.MAIL_USER;
+  const boundary = "mfbd_" + crypto.randomBytes(12).toString("hex");
+
+  const headers = [
+    `From: ${from}`,
+    `To: ${Array.isArray(to) ? to.join(", ") : to}`,
+    `Subject: ${encSubject}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+  ];
+  if (replyTo) headers.push(`Reply-To: ${replyTo}`);
+
+  const parts = [];
+  if (text) {
+    parts.push(
+      `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${text}\r\n`
+    );
+  }
+  if (html) {
+    parts.push(
+      `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\n\r\n${html}\r\n`
+    );
+  }
+  parts.push(`--${boundary}--\r\n`);
+
+  return headers.join("\r\n") + "\r\n\r\n" + parts.join("");
+}
+
 /**
- * Sends one email through SMTP2GO. `to` is a string or an array of strings;
- * `fromName` is folded into the sender string. Throws an Error with
+ * Sends one email through the Gmail API. `to` is a string or an array of
+ * strings; `fromName` labels MAIL_USER. Throws an Error with
  * `e.transient = true` for retryable failures.
  */
 async function sendMail({ to, subject, text, html, replyTo, fromName }) {
@@ -85,59 +170,44 @@ async function sendMail({ to, subject, text, html, replyTo, fromName }) {
     throw new Error("mail_disabled");
   }
 
-  const body = {
-    api_key: process.env.SMTP2GO_API_KEY,
-    sender: fromName
-      ? `${fromName} <${process.env.MAIL_USER}>`
-      : process.env.MAIL_USER,
-    to: Array.isArray(to) ? to : [to],
-    subject,
-  };
-  if (html) body.html_body = html;
-  if (text) body.text_body = text;
-  if (replyTo) body.custom_headers = [{ header: "Reply-To", value: replyTo }];
+  const token = await getAccessToken();
+  const raw = Buffer.from(
+    rfc2822({ to, subject, text, html, replyTo, fromName }),
+    "utf8"
+  ).toString("base64url");
 
   let res;
   try {
-    res = await fetch(SMTP2GO_API, {
+    res = await fetch(GMAIL_SEND_URL, {
       method: "POST",
       headers: {
-        accept: "application/json",
+        Authorization: `Bearer ${token}`,
         "content-type": "application/json",
-        "X-Smtp2go-Api-Key": process.env.SMTP2GO_API_KEY,
       },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(SMTP2GO_TIMEOUT_MS),
+      body: JSON.stringify({ raw }),
+      signal: AbortSignal.timeout(GMAIL_TIMEOUT_MS),
     });
   } catch (e) {
-    const err = new Error(`smtp2go network error: ${e.message}`);
+    const err = new Error(`gmail network error: ${e.message}`);
     err.transient = true;
     throw err;
   }
 
-  // SMTP2GO returns 200 even for per-recipient failures; check the payload.
-  if (res.status >= 200 && res.status < 300) {
-    let result = null;
-    try {
-      result = await res.json();
-    } catch (_) {}
-    const failed = result?.data?.failed || 0;
-    if (failed > 0) {
-      const err = new Error(
-        `smtp2go delivery failed: ${JSON.stringify(result?.data?.failures || [])}`
-      );
-      err.transient = false;
-      throw err;
-    }
-    return;
+  if (res.status === 401) {
+    // Access token rejected — drop the cache so the next try refreshes it.
+    gmailAccessToken = null;
+    const err = new Error("gmail 401: access token rejected");
+    err.transient = true;
+    throw err;
   }
+  if (res.status >= 200 && res.status < 300) return;
 
   let detail = "";
   try {
     const errBody = await res.json();
-    detail = errBody.data?.error || errBody.data?.error_code || "";
+    detail = errBody.error?.message || "";
   } catch (_) {}
-  const err = new Error(`smtp2go ${res.status}${detail ? ": " + detail : ""}`);
+  const err = new Error(`gmail ${res.status}${detail ? ": " + detail : ""}`);
   err.transient = res.status === 429 || res.status >= 500;
   throw err;
 }
