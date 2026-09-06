@@ -27,8 +27,11 @@ const crypto = require("crypto");
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
-const GRACE_PERIOD_HOURS = 2;
-const ALERT_THRESHOLD = 2; // consecutive missed doses before an email goes out
+// ⚠️ TEST VALUES — tighten before production:
+//   GRACE_PERIOD_MINUTES: 10 (test)  →  120 (real 2-hour grace)
+//   ALERT_THRESHOLD:       1  (test)  →  2    (alert after 2 misses)
+const GRACE_PERIOD_MINUTES = 10;
+const ALERT_THRESHOLD = 1; // consecutive missed doses before an email goes out
 const CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const APP_TZ = "Asia/Dhaka";
 const SEND_RATE_WINDOW_MS = 60 * 1000; // 1 minute
@@ -421,7 +424,9 @@ async function processReminder(reminderDoc) {
   const scheduledUTC = dhakaToUtc(
     parts.year, parts.month, parts.day, r.hour, r.minute
   );
-  const deadline = new Date(scheduledUTC.getTime() + GRACE_PERIOD_HOURS * 3600000);
+  const deadline = new Date(
+    scheduledUTC.getTime() + GRACE_PERIOD_MINUTES * 60000
+  );
   if (now < deadline) return;
 
   const logId = `${reminderId}_${dateKey}`;
@@ -592,7 +597,7 @@ async function sendCareLinkEmail(
       </div>
       <div style="border:1px solid #e0e0e0;border-top:none;padding:20px;border-radius:0 0 8px 8px;">
         <p>Hello,</p>
-        <p>MediFastBD CareLink has detected <strong>two or more consecutive missed medication doses</strong>.</p>
+        <p>MediFastBD CareLink has detected <strong>${count} consecutive missed medication dose${count === 1 ? "" : "s"}</strong>.</p>
         <table style="width:100%;border-collapse:collapse;margin:16px 0;">
           <tr><td style="padding:8px 12px;color:#666;border-bottom:1px solid #eee;">Patient</td><td style="padding:8px 12px;font-weight:bold;border-bottom:1px solid #eee;">${esc(patientName)}</td></tr>
           <tr><td style="padding:8px 12px;color:#666;border-bottom:1px solid #eee;">Medicine</td><td style="padding:8px 12px;font-weight:bold;border-bottom:1px solid #eee;">${esc(medicineName)}</td></tr>
