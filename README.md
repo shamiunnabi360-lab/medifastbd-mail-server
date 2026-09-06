@@ -6,21 +6,22 @@ Free-tier Node.js server that:
 2. Exposes a tiny `POST /send` endpoint for the Flutter app to send
    transactional emails (receipts, order updates).
 
-Runs on **Render Free** (no credit card). **Brevo** delivers the mail via
-its HTTPS API (300 emails/day free). Gmail SMTP does **not** work here —
+Runs on **Render Free** (no credit card). **SMTP2GO** delivers the mail via
+its HTTPS API (1,000 emails/month free). Gmail SMTP does **not** work here —
 Render blocks outbound SMTP ports (25/465/587) on every plan.
 
 ---
 
 ## One-time setup
 
-### 1. Brevo account (email delivery)
-1. Sign up free at https://app.brevo.com (no credit card).
-2. Verify **one sender**: Senders, Domains & Dedicated IPs → **Senders** →
-   add your Gmail address and confirm the verification email. Caregiver
+### 1. SMTP2GO account (email delivery)
+1. Sign up free at https://www.smtp2go.com (no credit card, no phone
+   verification — just confirm your email address).
+2. Verify **one sender**: Settings → **Verified Senders** → add your
+   Gmail address and click the confirmation link it receives. Caregiver
    alerts can then go to any recipient — no domain or DNS needed.
-3. Profile (top-right) → **SMTP & API** → **API Keys** → **Generate new
-   API key** → copy it (`xkeysib-…`).
+3. Settings → **API Keys** → **Add API Key** → copy it (starts with
+   `api-`).
 
 ### 2. Firebase service account
 1. Firebase Console → Project Settings → **Service accounts** →
@@ -41,8 +42,8 @@ Render blocks outbound SMTP ports (25/465/587) on every plan.
 4. **Environment**:
    | Key | Value |
    |---|---|
-   | `BREVO_API_KEY` | Brevo API key (`xkeysib-…`) |
-   | `MAIL_USER` | your **verified Brevo sender** email |
+   | `SMTP2GO_API_KEY` | SMTP2GO API key (`api-…`) |
+   | `MAIL_USER` | your **verified SMTP2GO sender** email |
    | `MAIL_SHARED_SECRET` | any random 32+ char string (Flutter sends it as `X-Mail-Secret`) |
    | `FIREBASE_SERVICE_ACCOUNT` | paste the entire JSON from step 2 on one line |
 5. Click **Create Web Service**. Wait for the first deploy.
@@ -99,7 +100,7 @@ Send a transactional email from your Flutter app.
 
 | Service | Limit | Notes |
 |---|---|---|
-| Brevo API | 300 emails / day | Plenty for caregiver alerts + receipts |
+| SMTP2GO API | 1,000 emails / month (200/day) | Plenty for caregiver alerts + receipts |
 | Render Free Web Service | 750 hrs / month | Always-on with the uptime pinger |
 | Firestore (Spark) | 50k reads / day | CareLink uses ~100 reads / patient / day |
 | `/send` rate limit | 30 / min / IP | Adjustable in `server.js` |
@@ -110,7 +111,7 @@ Send a transactional email from your Flutter app.
 
 ```bash
 cd carelink-server
-cp ../.env.example .env   # add BREVO_API_KEY / MAIL_USER / etc.
+cp ../.env.example .env   # add SMTP2GO_API_KEY / MAIL_USER / etc.
 npm install
 node server.js
 ```

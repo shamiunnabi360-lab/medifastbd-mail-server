@@ -13,8 +13,8 @@
  *
  * Required environment variables:
  *   FIREBASE_SERVICE_ACCOUNT   — JSON string of Firebase service account key
- *   BREVO_API_KEY              — Brevo transactional email API key (300/day free)
- *   MAIL_USER                  — verified sender email (the address Brevo sends from)
+ *   SMTP2GO_API_KEY            — SMTP2GO API key (1,000 emails/month free)
+ *   MAIL_USER                  — verified sender email (the address SMTP2GO sends from)
  *   MAIL_SHARED_SECRET         — secret header value for the /send endpoint
  *   PORT                       — optional, defaults to 3000
  */
@@ -52,73 +52,92 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// ─── Email sending (Brevo HTTP API) ─────────────────────────────────────
+// ─── Email sending (SMTP2GO HTTP API) ───────────────────────────────────
 // Render blocks outbound SMTP ports (25/465/587) on every plan, so Gmail
-// SMTP is unreachable from there. Brevo's HTTPS API works from any host;
-// the free tier allows 300 emails/day with a single verified sender.
+// SMTP is unreachable from there. SMTP2GO's HTTPS API works from any host;
+// the free plan allows 1,000 emails/month (200/day, 25/hour) with a single
+// verified sender — no domain, no phone verification.
 
-const BREVO_API = "https://api.brevo.com/v3/smtp/email";
-const BREVO_TIMEOUT_MS = 15000;
+const SMTP2GO_API = "https://api.smtp2go.com/v3/email/send";
+const SMTP2GO_TIMEOUT_MS = 15000;
 
-function brevoConfigured() {
-  return Boolean(process.env.BREVO_API_KEY && process.env.MAIL_USER);
+function mailConfigured() {
+  return Boolean(process.env.SMTP2GO_API_KEY && process.env.MAIL_USER);
 }
 
 function warnMailDisabled() {
-  if (!process.env.BREVO_API_KEY) {
-    console.warn("⚠️  BREVO_API_KEY not set. Email disabled.");
+  if (!process.env.SMTP2GO_API_KEY) {
+    console.warn("⚠️  SMTP2GO_API_KEY not set. Email disabled.");
   }
   if (!process.env.MAIL_USER) {
-    console.warn("⚠️  MAIL_USER (verified Brevo sender) not set. Email disabled.");
+    console.warn("⚠️  MAIL_USER (verified SMTP2GO sender) not set. Email disabled.");
   }
 }
 
 /**
- * Sends one email through Brevo. `to` is a string or an array of strings;
- * `fromName` labels the verified sender (the address itself is MAIL_USER).
- * Throws an Error with `e.transient = true` for retryable failures.
+ * Sends one email through SMTP2GO. `to` is a string or an array of strings;
+ * `fromName` is folded into the sender string. Throws an Error with
+ * `e.transient = true` for retryable failures.
  */
 async function sendMail({ to, subject, text, html, replyTo, fromName }) {
-  if (!brevoConfigured()) {
+  if (!mailConfigured()) {
     warnMailDisabled();
     throw new Error("mail_disabled");
   }
 
   const body = {
-    sender: { name: fromName || "MediFastBD", email: process.env.MAIL_USER },
-    to: (Array.isArray(to) ? to : [to]).map((email) => ({ email })),
+    api_key: process.env.SMTP2GO_API_KEY,
+    sender: fromName
+      ? `${fromName} <${process.env.MAIL_USER}>`
+      : process.env.MAIL_USER,
+    to: Array.isArray(to) ? to : [to],
     subject,
   };
-  if (html) body.htmlContent = html;
-  if (text) body.textContent = text;
-  if (replyTo) body.replyTo = { email: replyTo };
+  if (html) body.html_body = html;
+  if (text) body.text_body = text;
+  if (replyTo) body.custom_headers = [{ header: "Reply-To", value: replyTo }];
 
   let res;
   try {
-    res = await fetch(BREVO_API, {
+    res = await fetch(SMTP2GO_API, {
       method: "POST",
       headers: {
         accept: "application/json",
         "content-type": "application/json",
-        "api-key": process.env.BREVO_API_KEY,
+        "X-Smtp2go-Api-Key": process.env.SMTP2GO_API_KEY,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(BREVO_TIMEOUT_MS),
+      signal: AbortSignal.timeout(SMTP2GO_TIMEOUT_MS),
     });
   } catch (e) {
-    const err = new Error(`brevo network error: ${e.message}`);
+    const err = new Error(`smtp2go network error: ${e.message}`);
     err.transient = true;
     throw err;
   }
 
-  if (res.status >= 200 && res.status < 300) return;
+  // SMTP2GO returns 200 even for per-recipient failures; check the payload.
+  if (res.status >= 200 && res.status < 300) {
+    let result = null;
+    try {
+      result = await res.json();
+    } catch (_) {}
+    const failed = result?.data?.failed || 0;
+    if (failed > 0) {
+      const err = new Error(
+        `smtp2go delivery failed: ${JSON.stringify(result?.data?.failures || [])}`
+      );
+      err.transient = false;
+      throw err;
+    }
+    return;
+  }
 
   let detail = "";
   try {
     const errBody = await res.json();
-    detail = errBody.message || errBody.code || "";
+    detail = errBody.data?.error || errBody.data?.error_code || "";
   } catch (_) {}
-  const err = new Error(`brevo ${res.status}${detail ? ": " + detail : ""}`);
+  const err = new Error(`smtp2go ${res.status}${detail ? ": " + detail : ""}`);
   err.transient = res.status === 429 || res.status >= 500;
   throw err;
 }
@@ -258,7 +277,7 @@ app.post("/send", rateLimit, requireSecret, async (req, res) => {
     return res.status(400).json({ error: "subject_too_long" });
   }
 
-  if (!brevoConfigured()) {
+  if (!mailConfigured()) {
     warnMailDisabled();
     return res.status(503).json({ error: "mail_disabled" });
   }
@@ -474,7 +493,7 @@ async function handleMissed(reminderDoc, reminder, dateKey) {
 async function sendCareLinkEmail(
   userId, medicineName, email1, email2, count, hour, minute
 ) {
-  if (!brevoConfigured()) {
+  if (!mailConfigured()) {
     warnMailDisabled();
     return;
   }

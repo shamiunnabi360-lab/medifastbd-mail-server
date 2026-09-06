@@ -1,7 +1,7 @@
 {
   "name": "medifastbd-mail-server",
   "version": "1.0.0",
-  "description": "MediFastBD Mail Server - missed-dose alerts and transactional email via Brevo HTTP API",
+  "description": "MediFastBD Mail Server - missed-dose alerts and transactional email via SMTP2GO HTTP API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
